@@ -1,0 +1,11 @@
+# 编译生成的缓存文件
+__pycache__/
+
+# 环境变量文件
+.env
+
+# 日志文件
+*.log
+
+# 其他
+simple_agent.py
