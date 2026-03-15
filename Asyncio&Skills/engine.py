@@ -1,6 +1,7 @@
 import json
 import traceback
 import inspect # 新增 - 用于检查工具是同步还是异步
+import asyncio
 from langfuse import observe
 from config import client, Config, logger
 from prompts import SYSTEM_PROMPT, REFLECTION_PROMPT
@@ -262,65 +263,89 @@ class ReActAgent:
                 yield "\n[系统] 模型返回为空，结束思考。"
                 break
             
-            # 如果触发了工具调用，开始执行
+            # --- 核心改进 多工具并行执行 ---
             if tool_calls_list:
+                # 任务分类，将“常规工具”和“交卷工具”分开
+                normal_tool_calls = []
+                submit_call = None
                 for tc in tool_calls_list:
+                    if tc["function"]["name"] == "submit_final_answer":
+                        submit_call = tc
+                    else:
+                        normal_tool_calls.append(tc)
+
+                # 并发执行常规工具
+                if normal_tool_calls:
+                    tool_names = [tc["function"]["name"] for tc in normal_tool_calls]
+                    yield f"\n[⚡ 并发调用 {len(normal_tool_calls)} 个工具: {', '.join(tool_names)} ...]"
+                    
+                    # 内部异步函数，用于包装单个工具的执行逻辑
+                    async def execute_single_tool(tc):
+                        func_name = tc["function"]["name"]
+                        raw_args = tc["function"]["arguments"]
+                        func_args = self._safe_json_parse(raw_args)
+                        tool_call_id = tc["id"] # 每个调用都有唯一 ID
+                    
+                        yield f"\n\n[⚙️ 正在调用工具: {func_name} ...]\n"
+                        
+                        if func_args is None:
+                            return tool_call_id, f"错误：工具参数 JSON 格式非法: {raw_args}。请修正你的输出格式。"
+                        # 工具执行逻辑
+                        elif func_name not in TOOL_MAP:
+                            return tool_call_id, f"错误：工具 {func_name} 不存在。"
+                        else:                        
+                            logger.info(f"执行工具: {func_name} | 参数: {func_args}")
+                            try:
+                                # 智能工具执行，兼容同步和异步工具
+                                target_func = TOOL_MAP[func_name]
+                                if inspect.iscoroutinefunction(target_func):
+                                    # 如果是 async def 工具，原生等待
+                                    res = await target_func(**func_args)
+                                else:
+                                    # 如果是普通的 def 工具（如繁重的计算或读写文件），
+                                    # 把它扔进底层的线程池执行，绝对不阻塞 Async 主线程！
+                                    res = await asyncio.to_thread(func_name, **func_args)
+                                return tool_call_id, str(res)
+                            except Exception as e:
+                                error_detail = traceback.format_exc()
+                                logger.error(f"工具 {func_name} 崩溃: {error_detail}")
+                                return tool_call_id, f"工具执行异常:\n{error_detail}\n请修正后重新尝试！"
+                                
+                    # 使用 asyncio.gather 瞬间同时启动所有常规工具
+                    tasks = [execute_single_tool(tc) for tc in normal_tool_calls]
+                    results = await asyncio.gather(*tasks)
+
+                    # 将所有并发执行的结果批量存入数据库和上下文
+                    for tool_call_id, obs in results:
+                        self._save_and_append("tool", content=obs, tool_call_id=tool_call_id)
+                    
+                    # 如果这轮没有交卷，则继续下一轮思考
+                    if not submit_call:
+                        continue
+
+                # 独立处理交卷工具 (Reflection 拦截)
+                if submit_call:
                     func_name = tc["function"]["name"]
                     raw_args = tc["function"]["arguments"]
                     func_args = self._safe_json_parse(raw_args)
-                    tool_call_id = tc["id"] # 每个调用都有唯一 ID
+                    tool_call_id = tc["id"]
                     
-
-                    # --- 认知核心：反思拦截 ---
-                    if func_name == "submit_final_answer":
-                        draft_answer = func_args.get("answer", "未提取到答案。")
-                        yield f"\n\n[🕵️ 系统审核拦截 (Self-Reflection)...]\n"
+                    draft_answer = func_args.get("answer", "未提取到答案。") if func_args else "解析失败"
+                    yield f"\n\n[🕵️ 系统审核拦截 (Self-Reflection)...]\n"
                         
-                        # 触发大模型自身去审视草稿
-                        is_pass, feedback = await self._run_reflection(user_query, draft_answer)
+                        # 触发大模型审视草稿
+                    is_pass, feedback = await self._run_reflection(user_query, draft_answer)
                         
-                        if is_pass:
-                            yield f"✅ 审核通过！\n\n🎯 最终回答:\n{draft_answer}"
-                            self._save_and_append("tool", content="审核通过。任务结束。", tool_call_id=tool_call_id)
-                            self._check_and_summarize()
-                            return # 真正结束并退出
-                        else:
-                            yield f"❌ 审核被驳回：{feedback}\n[🔄 触发自愈纠错机制 (Self-Correction)...]\n"
-                            obs = f"你的回答被系统 Reviewer 驳回！必须修正，驳回理由：\n{feedback}"
-                            self._save_and_append("tool", content=obs, tool_call_id=tool_call_id)
-                            continue # 直接进入下一轮重试
-                    
-                    
-
-                    # --- 常规工具执行与自愈增强 ---
-                    yield f"\n\n[⚙️ 正在调用工具: {func_name} ...]\n"
-                    
-                    if func_args is None:
-                        obs = f"错误：工具参数 JSON 格式非法: {raw_args}。请修正你的输出格式。"
-                    # 工具执行逻辑
-                    elif func_name not in TOOL_MAP:
-                        obs = f"错误：工具 {func_name} 不存在。"
-                    else:                        
-                        logger.info(f"执行工具: {func_name} | 参数: {func_args}")
-                        try:
-                            # --- 核心修改：智能工具执行，兼容同步和异步工具 ---
-                            target_func = TOOL_MAP[func_name]
-                            if inspect.iscoroutinefunction(target_func):
-                                obs = await target_func(**func_args) # 如果是 async def 的工具，await 它
-                            else:
-                                obs = TOOL_MAP[func_name](**func_args) # 如果是普通的 def 工具，直接执行
-                        except Exception as e:
-                            # 错误自愈增强 - 将详细的 traceback 喂给大模型，让它知道代码错在哪
-                            error_detail = traceback.format_exc()
-                            obs = f"工具执行发生严重异常:\n{error_detail}\n请仔细检查参数逻辑，修正后重新尝试！"
-                            logger.error(f"工具 {func_name} 崩溃: {error_detail}")
-                                            
-                    # 把结果喂回给大模型上下文
-                    # 必须包含 tool_call_id，角色必须是 "tool"
-                    self._save_and_append("tool", content=str(obs), tool_call_id=tool_call_id)
-                
-                # 执行完工具后，由于 continue，会自动进入下一个 turn 让大模型基于 observation 继续思考
-                continue
+                    if is_pass:
+                        yield f"✅ 审核通过！\n\n🎯 最终回答:\n{draft_answer}"
+                        self._save_and_append("tool", content="审核通过。任务结束。", tool_call_id=tool_call_id)
+                        await self._check_and_summarize()
+                        return # 真正结束并退出
+                    else:
+                        yield f"❌ 审核被驳回：{feedback}\n[🔄 触发自愈纠错机制...]\n"
+                        obs = f"你的回答被系统 Reviewer 驳回！必须修正，驳回理由：\n{feedback}"
+                        self._save_and_append("tool", content=obs, tool_call_id=tool_call_id)
+                        continue # 直接进入下一轮重试
             
             else:
                 # 防御机制：如果模型忘记调用 submit_final_answer 直接输出了文本
