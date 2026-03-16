@@ -178,12 +178,12 @@ class ReActAgent:
         skills_to_load = ["base"] + active_skills
         yield f"技能装载完成，当前激活模块: {skills_to_load}"
 
-        TOOL_MAP = {}
-        TOOLS_SCHEMA = []
+        current_tool_map = {}
+        current_tools_schema = []
         for skill in set(skills_to_load):
             if skill in SKILL_REGISTRY:
-                TOOL_MAP.update(SKILL_REGISTRY[skill]["tools"])
-                TOOLS_SCHEMA.extend(SKILL_REGISTRY[skill]["schemas"])
+                current_tool_map.update(SKILL_REGISTRY[skill]["tools"])
+                current_tools_schema.extend(SKILL_REGISTRY[skill]["schemas"])
 
 
         for turn in range(max_turns):
@@ -194,7 +194,7 @@ class ReActAgent:
                 response = await client.chat.completions.create(
                     model=Config.MODEL,
                     messages=self.messages,
-                    tools=TOOLS_SCHEMA, # --- 不再传全局 SCHEMA，而是传刚才动态拼装的 ---
+                    tools=current_tools_schema, # --- 不再传全局 SCHEMA，而是传刚才动态拼装的 ---
                     tool_choice="auto",
                     temperature=0.3, # 促进思考
                     stream=True,
@@ -291,13 +291,19 @@ class ReActAgent:
                         if func_args is None:
                             return tool_call_id, f"错误：工具参数 JSON 格式非法: {raw_args}。请修正你的输出格式。"
                         # 工具执行逻辑
-                        elif func_name not in TOOL_MAP:
+                        elif func_name not in current_tool_map:
                             return tool_call_id, f"错误：工具 {func_name} 不存在。"
                         else:                        
                             logger.info(f"执行工具: {func_name} | 参数: {func_args}")
                             try:
                                 # 智能工具执行，兼容同步和异步工具
-                                target_func = TOOL_MAP[func_name]
+                                target_func = current_tool_map[func_name]
+
+                                # --- 核心改进，反射注入 Agent 上下文 ---
+                                sig = inspect.signature(target_func)
+                                if "agent_context" in sig.parameters:
+                                    func_args["agent_context"] = self # 把 Agent 自己传进去
+
                                 if inspect.iscoroutinefunction(target_func):
                                     # 如果是 async def 工具，原生等待
                                     res = await target_func(**func_args)

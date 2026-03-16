@@ -1,6 +1,8 @@
 import os
 import json
 import inspect
+from typing import Any, List, Dict, Optional # 引入复杂的类型提示
+from pydantic import create_model, Field     # 引入 Pydantic 神器
 from config import tavily
 
 
@@ -21,42 +23,50 @@ SKILL_REGISTRY = {
 
 def register_tool(category="base"):
     """
-    带分类的工具注册装饰器
+    工业级工具注册器：自动将复杂的 Python Type Hints (如 List[str], Dict) 
+    无损转化为 OpenAI 支持的严格 JSON Schema。
     """
     def decorator(func):
         sig = inspect.signature(func)
         doc = inspect.getdoc(func) or ""
-        properties = {}
-        required =[]
-    
+
+        # --- 动态收集 Pydantic 字段配置 ---
+        fields = {}
         for name, param in sig.parameters.items():
-            # 将 Python 类型映射为 JSON Schema 类型
-            param_type = "string"
-            if param.annotation == int: param_type = "integer"
-            elif param.annotation == float: param_type = "number"
-            elif param.annotation == bool: param_type = "boolean"
-            elif param.annotation == list: param_type = "array"
-            elif param.annotation == dict: param_type = "object"
+            # --- 上下文穿透 ---
+            # 如果参数名叫 agent_context，直接跳过，绝不暴露给大模型
+            if name == "agent_context":
+                continue
+
+            # 获取参数的类型注解，如果没写类型，默认视为 Any (任何类型)
+            annotation = param.annotation if param.annotation != inspect.Parameter.empty else Any
             
-            properties[name] = {
-                "type": param_type,
-                "description": f"参数 {name}" # 简易处理：如有需要，可通过正则从 doc 中提取更详细的参数说明
-            }
-            
-            # 如果没有默认值，则为必填项
+            # 判断是否有默认值。如果没有默认值，在 Pydantic 中用 ... 表示必填 (Required)
             if param.default == inspect.Parameter.empty:
-                required.append(name)
-                
+                default_val = ...
+            else:
+                default_val = param.default
+
+            # 将每个参数组装为 Pydantic 所需的 Field
+            fields[name] = (annotation, Field(default=default_val, description=f"参数 {name}"))
+            
+        # 运行时“凭空”捏造一个 Pydantic 数据模型类 (Metaprogramming)
+        # 例如定义了 def calc(a: int), 这里就会在内存里生成一个 class calc_Params(BaseModel): a: int
+        pydantic_model = create_model(f"{func.__name__}_Params", **fields)
+        
+        # 直接让 Pydantic 交出 JSON Schema
+        model_schema = pydantic_model.model_json_schema()
+
+        # 移除 Pydantic 自动生成的 title 字段（为了让传给 OpenAI 的 JSON 更干净省 Token）
+        model_schema.pop("title", None)
+
+        # 组装成 OpenAI 标准 Function Calling 格式
         schema = {
             "type": "function",
             "function": {
                 "name": func.__name__,
                 "description": doc.strip().replace("\n", " "), # 将多行注释压缩
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required
-                }
+                "parameters": model_schema  # 直接把 Pydantic 生成的完美字典塞进来
             }
         }
         
@@ -111,13 +121,26 @@ async def read_local_file(file_path: str) -> str:
     except Exception as e:
         return f"读取文件失败: {e}"
 
+# 重写 write_local_file 工具，让它自动在特定 session_id 的专属文件夹里保存文件
 @register_tool(category="office")
-async def write_local_file(file_path: str, content: str) -> str:
-    """将内容写入或覆盖到本地文件中。如果文件不存在会自动创建。"""
+async def write_local_file(file_name: str, content: str, agent_context=None) -> str:
+    """
+    将内容写入或覆盖到本地文件中。如果文件不存在会自动创建。
+    """
     try:
+        # 上下文穿透作用：大模型只传了 file_name 和 content
+        # 但我们在底层拿到了 Agent 实例，从而可以读取它的 session_id！
+        session_id = agent_context.session_id if agent_context else "default_session"
+
+        # 为每个对话创建一个专属文件夹
+        save_dir = os.path.join("workspace", session_id)
+        os.makedirs(save_dir, exist_ok=True)
+
+        file_path = os.path.join(save_dir, file_name)
+
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(content)
-        return f"成功！内容已保存至 {file_path}"
+        return f"成功！内容已隔离保存至您的专属工作区: {file_path}"
     except Exception as e:
         return f"写入文件失败: {e}"
 
@@ -158,3 +181,14 @@ async def generate_dialogue_json(npc_name: str, topic: str) -> str:
         ]
     }
     return json.dumps(mock_tree, ensure_ascii=False, indent=2)
+
+# Pydantic 演示用例：极其复杂的嵌套参数，Pydantic 也能一秒解析
+@register_tool(category="gamedev")
+async def batch_update_monsters(
+    scene_id: str, 
+    monsters_data: List[Dict[str, int]], # 魔法在这里！List 里面套 Dict，Dict 里面套字符串和数字
+    is_boss_level: Optional[bool] = False # 甚至支持 Optional (非必填项)
+) -> str:
+    """批量更新当前场景下怪物的血量和攻击力。"""
+    # 真实执行逻辑...
+    return f"已更新场景 {scene_id} 中的 {len(monsters_data)} 只怪物。"
