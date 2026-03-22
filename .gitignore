@@ -11,5 +11,8 @@ __pycache__/
 *.db
 **/memory_db/
 
+# 工作区文件
+**/workspace/
+
 # 其他
 simple_agent.py
