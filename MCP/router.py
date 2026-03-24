@@ -1,45 +1,32 @@
 import json
 from config import client, Config, logger
-from tools import CATEGORY_METADATA
+from tools import TOOLKIT_METADATA
 
 async def route_intent(user_query: str) -> list:
     """
     独立出的技能路由层 (Tool Router 网关)
     根据用户意图，动态决定激活哪些领域的技能包。
     """
-    # 动态拼接可用技能包描述
-    skills_description = ""
-    for cat, desc in CATEGORY_METADATA.items():
-        skills_description += f"- \"{cat}\": {desc}\n"
+    # 构造给 Router 看的菜单
+    menu = "\n".join([f"- {name}: {meta}" for name, meta in TOOLKIT_METADATA.items()])
     
     router_prompt = f"""
-    你是一个极其轻量、高效的意图分类网关 (Tool Router)。
-    请判断需求所属技能包，并严格以 JSON 格式返回 (必须包含关键字 "json")。
-    
-    当前可用的技能包和说明如下：
-    {skills_description}
-    
-    【强制判定规则】：
-    1. 只要用户的指令中暗示了要生成、写入、保存文件到本地（无论提到 word, txt, docx 还是“建个文件”），你都必须返回 ["office"]！绝不能视为普通聊天！
-    2. 只要用户提到“运行命令”、“执行脚本”、“安装插件”、“环境”、“终端”、“命令行”、“Bash”、“CMD”，或者要求“运行刚才写的代码”，你都必须返回 ["system"]！
-    3. 只有纯粹的知识问答、闲聊，才返回空列表 []。
-    
-    【分类示例 (Few-Shot)】：
-    用户输入: "帮我把书名写进word"
-    返回: {{"active_skills": ["office"]}}
-    
-    用户输入: "帮我运行一下这个 python 脚本"
-    返回: {{"active_skills": ["system"]}}
-    
-    用户输入: "安装 pandas 库"
-    返回: {{"active_skills": ["system"]}}
-    
-    用户输入: "量子力学是什么"
-    返回: {{"active_skills": []}}
-    """
+    你是一个高层意图分配网关。请根据用户的问题，从以下【能力领域】中挑选出解决问题所必需的工具箱名。
+    请严格返回 JSON 格式，必须包含 "json" 字样。
 
-    # 自动提取所有合法的技能分类名 (如["office", "gamedev"])
-    # valid_skills = list(CATEGORY_METADATA.keys())
+    【能力领域菜单】：
+    {menu}
+    
+    【决策准则】：
+    1. 如果用户要求写代码、读写文件、操作 Word/Txt，请选择 "office"。
+    2. 如果涉及游戏业务逻辑、Unity 报错、数值计算，请选择 "gamedev"。
+    3. 如果涉及运行脚本、安装软件、执行终端 Bash 指令，请选择 "system"。
+    4. 如果只是普通问答或搜索，返回空列表 []。
+    
+    【示例 (Few-Shot)】：
+    {{ "active_toolkits": ["工具箱名1", "工具箱名2"] }}
+    {{"active_skills": ["office","system"]}}
+    """
 
     try:
         # 换成成本低的小模型，这仅仅是个分类任务！
@@ -85,7 +72,8 @@ async def route_intent(user_query: str) -> list:
         # json schema：此时拿到的内容，100% 绝对是合法的 JSON，且绝对不包含不存在的技能名
         # json object：可能出错，使用 Few-Shot
         result = json.loads(resp.choices[0].message.content)
-        skills = result.get("active_skills",[])
+        # 兼容大模型可能输出 active_skills 或 active_toolkits
+        skills = result.get("active_toolkits") or result.get("active_skills") or []
         return skills
     
     except Exception as e:

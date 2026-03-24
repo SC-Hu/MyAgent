@@ -3,6 +3,8 @@ from engine import ReActAgent
 from database import db
 from config import Config
 from utils import count_tokens
+from tools import TOOLKIT_REGISTRY
+from memory_manager import long_term_memory
 
 
 def print_help():
@@ -47,6 +49,8 @@ async def main():
     # 初始默认开启一个新会话
     current_session_id = db.create_session(title="新会话")
     agent = ReActAgent(current_session_id)
+    # 【新增】同步工具索引：让 Agent 知道一共会哪些技能
+    long_term_memory.index_all_tools(TOOLKIT_REGISTRY)
 
     print("🌟 智能体已启动。输入 / 查看功能。")
     print("--- 提示：输入 'exit' 或 'quit' 退出程序 ---")

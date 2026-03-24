@@ -8,22 +8,35 @@ from config import tavily
 from config import Config
 
 
-# --- 技能包元数据（描述各领域的作用，专门喂给 Router 看的） ---
-CATEGORY_METADATA = {
+# --- Toolkit 元数据：这是给 Router 看的“部门简介” ---
+TOOLKIT_METADATA = {
     "office": "涉及读取/生成/写入本地文件(如 txt, md, word, doc 等)、代码文档、收发邮件、办公自动化操作。",
-    "gamedev": "涉及游戏开发、引擎崩溃报错日志分析、剧情对话树生成、游戏数值平衡。",
+    "gamedev": "游戏开发管线：处理 Unity/Unreal 引擎日志、生成对话 JSON、调整怪物数值等游戏业务。",
     "system": "执行底层终端命令(Bash/CMD)、管理本地系统环境、运行脚本、安装软件包。该模块操作具有高风险。" # 新增
     # base 技能（搜索和提交）是底层被动技能，不需要让 Router 知道，直接默认加载
 }
 
 
 # --- 将原本单一的字典，升级为分类存储的技能注册表 ---
-SKILL_REGISTRY = {
-    "base": {"tools": {}, "schemas": []},
-    "office": {"tools": {}, "schemas":[]},
-    "gamedev": {"tools": {}, "schemas":[]},
-    "system": {"tools": {}, "schemas":[]} # 新增
+TOOLKIT_REGISTRY = {}
+
+""" 注册表结构
+{
+    "toolkit name": {
+        "description": "toolkit description",
+        "tools": {
+            "native::office::write_local_file": {
+                "func": <function write_local_file at 0x...>,
+                "requires_approval": False,
+                "description": "在工作区生成文件。支持写入代码或文本内容。"
+            }
+        },
+        "schemas": [
+            { "type": "function", "function": { "name": "native::office::write_local_file", ... } }
+        ]
+    }
 }
+"""
 
 
 def get_safe_path(target_path: str) -> str:
@@ -42,38 +55,37 @@ def get_safe_path(target_path: str) -> str:
     return absolute_target
 
 
-def register_tool(category="base", requires_approval=False):
+def register_tool(toolkit: str, source="native", requires_approval=False):
     """
-    工业级工具注册器：自动将复杂的 Python Type Hints (如 List[str], Dict) 
-    无损转化为 OpenAI 支持的严格 JSON Schema。
+    全限定名工具注册器。
+    生成 ID 格式：source::toolkit::toolname
     """
     def decorator(func):
+        tool_name = func.__name__
+        # 生成全限定名 ID
+        tool_id = f"{source}_{toolkit}_{tool_name}"
+
+        # Pydantic Schema 生成逻辑
         sig = inspect.signature(func)
         doc = inspect.getdoc(func) or ""
-
-        # --- 动态收集 Pydantic 字段配置 ---
         fields = {}
         for name, param in sig.parameters.items():
-            # --- 上下文穿透 ---
             # 如果参数名叫 agent_context，直接跳过，绝不暴露给大模型
             if name == "agent_context":
                 continue
-
-            # 获取参数的类型注解，如果没写类型，默认视为 Any (任何类型)
+            # 获取参数的类型注解，如果没写类型，默认视为 str
             annotation = param.annotation if param.annotation != inspect.Parameter.empty else str
-            
             # 判断是否有默认值。如果没有默认值，在 Pydantic 中用 ... 表示必填 (Required)
             if param.default == inspect.Parameter.empty:
                 default_val = ...
             else:
                 default_val = param.default
-
             # 将每个参数组装为 Pydantic 所需的 Field
             fields[name] = (annotation, Field(default=default_val, description=f"参数 {name}"))
             
         # 运行时“凭空”捏造一个 Pydantic 数据模型类 (Metaprogramming)
         # 例如定义了 def calc(a: int), 这里就会在内存里生成一个 class calc_Params(BaseModel): a: int
-        pydantic_model = create_model(f"{func.__name__}_Params", **fields)
+        pydantic_model = create_model(f"{tool_name}_Params", **fields)
         
         # 直接让 Pydantic 交出 JSON Schema
         model_schema = pydantic_model.model_json_schema()
@@ -81,32 +93,67 @@ def register_tool(category="base", requires_approval=False):
         # 移除 Pydantic 自动生成的 title 字段（为了让传给 OpenAI 的 JSON 更干净省 Token）
         model_schema.pop("title", None)
 
+        """ Pydantic 结构
+        {
+            "type": "object",
+            "properties": {
+                "file_name": {
+                "type": "string",
+                "description": "参数 file_name"
+                },
+                "content": {
+                "type": "string",
+                "description": "参数 content"
+                }
+            },
+            "required": ["file_name", "content"],
+            "additionalProperties": false
+        }
+        """
+
         # 组装成 OpenAI 标准 Function Calling 格式
         schema = {
             "type": "function",
             "function": {
-                "name": func.__name__,
+                "name": tool_id, # 使用全限定名作为函数名
                 "description": doc.strip().replace("\n", " "), # 将多行注释压缩
                 "parameters": model_schema  # 直接把 Pydantic 生成的完美字典塞进来
             }
         }
         
-        # 将工具存入对应的分类抽屉中
-        if category not in SKILL_REGISTRY:
-            SKILL_REGISTRY[category] = {"tools": {}, "schemas": []}
-        
-        SKILL_REGISTRY[category]["tools"][func.__name__] = {
-            "func": func,
-            "requires_approval": requires_approval # 是否需要审批
+        """ OpenAI 协议格式
+        {
+            "type": "function",
+            "function": {
+                "name": "native::office::write_local_file",
+                "description": "在工作区生成文件。支持写入代码或文本内容。",
+                "parameters": { ... 上面的 model_schema ... }
+            }
         }
-        SKILL_REGISTRY[category]["schemas"].append(schema)
+        """
+
+        # 注册到工具箱
+        if toolkit not in TOOLKIT_REGISTRY:
+            TOOLKIT_REGISTRY[toolkit] = {
+                "description": TOOLKIT_METADATA.get(toolkit, ""),
+                "tools": {},
+                "schemas": []
+            }
+        
+        TOOLKIT_REGISTRY[toolkit]["tools"][tool_id] = {
+            "func": func,
+            "requires_approval": requires_approval, # 是否需要审批
+            "description": inspect.getdoc(func).strip() # 用于 RAG 检索的文本
+        }
+        TOOLKIT_REGISTRY[toolkit]["schemas"].append(schema)
+
         return func
     return decorator
 
 
 # System Skill
 
-@register_tool(category="system", requires_approval=True)
+@register_tool(toolkit="system", requires_approval=True)
 async def execute_bash(command: str, agent_context=None) -> str:
     """
     【高危】在本地 workspace 目录下执行终端命令。
@@ -166,7 +213,7 @@ async def execute_bash(command: str, agent_context=None) -> str:
 
 # Base Skill
 
-@register_tool(category="base")
+@register_tool(toolkit="base")
 def google_search(query: str) -> str:
     """
     当用户询问实时信息、新闻、历史事实、特定人物或需要查阅互联网资料时使用。
@@ -180,7 +227,7 @@ def google_search(query: str) -> str:
         return f"搜索过程中发生错误: {str(e)}"
 
 # 大模型使用的“提交答案”工具
-@register_tool(category="base")
+@register_tool(toolkit="base")
 def submit_final_answer(answer: str) -> str:
     """
     当且仅当你确信已经完美解决用户问题时，调用此工具将最终答案提交给用户。
@@ -192,7 +239,7 @@ def submit_final_answer(answer: str) -> str:
 
 # Office Skill
 
-@register_tool(category="office")
+@register_tool(toolkit="office")
 async def read_local_file(file_path: str) -> str:
     """读取本地计算机上的文本文件（如 .txt, .md, .py）。传入绝对或相对路径。"""
     try:
@@ -214,7 +261,7 @@ async def read_local_file(file_path: str) -> str:
         return f"读取文件失败: {e}"
 
 # 重写 write_local_file 工具，让它自动在特定 session_id 的专属文件夹里保存文件
-@register_tool(category="office")
+@register_tool(toolkit="office")
 async def write_local_file(file_name: str, content: str) -> str:
     """
     将内容写入或覆盖到本地文件中。如果文件不存在会自动创建。
@@ -233,7 +280,7 @@ async def write_local_file(file_name: str, content: str) -> str:
     except Exception as e:
         return f"写入失败: {e}"
 
-@register_tool(category="office")
+@register_tool(toolkit="office")
 async def send_mock_email(to_address: str, subject: str, body: str) -> str:
     """发送工作邮件给指定联系人。"""
     # 这里我们用 mock 模拟，如果你有真实 SMTP 需求可以替换
@@ -242,7 +289,7 @@ async def send_mock_email(to_address: str, subject: str, body: str) -> str:
 
 # GameDev Skill
 
-@register_tool(category="gamedev")
+@register_tool(toolkit="gamedev")
 async def analyze_engine_log(log_snippet: str) -> str:
     """
     当 Unity 或 Unreal 引擎崩溃时，分析报错日志切片。
@@ -255,7 +302,7 @@ async def analyze_engine_log(log_snippet: str) -> str:
         return "诊断结果：C++ 内存越界或野指针。请检查最近修改的 Unmanaged 内存分配逻辑。"
     return "诊断结果：未知报错。请尝试使用 google_search 工具查找该 Error Code。"
 
-@register_tool(category="gamedev")
+@register_tool(toolkit="gamedev")
 async def generate_dialogue_json(npc_name: str, topic: str) -> str:
     """
     根据剧情设定，为指定 NPC 生成合法的对话树结构（直接输出供引擎读取的 JSON 字符串格式）。
@@ -272,7 +319,7 @@ async def generate_dialogue_json(npc_name: str, topic: str) -> str:
     return json.dumps(mock_tree, ensure_ascii=False, indent=2)
 
 # Pydantic 演示用例：极其复杂的嵌套参数，Pydantic 也能一秒解析
-@register_tool(category="gamedev")
+@register_tool(toolkit="gamedev")
 async def batch_update_monsters(
     scene_id: str, 
     monsters_data: List[Dict[str, int]], # 魔法在这里！List 里面套 Dict，Dict 里面套字符串和数字

@@ -48,12 +48,20 @@ class MemoryManager:
     def __init__(self):
         # 初始化 ChromaDB 持久化存储
         self.client = chromadb.PersistentClient(path="./memory_db")
+        self.emb_fn = CustomEmbeddingFunction()
         
-        # 创建 Collection，传入自定义的 Embedding 函数，ChromaDB 会自动识别 __call__
-        self.collection = self.client.get_or_create_collection(
+        # --- 1. 对话记忆集合 (原有功能) ---
+        self.chat_collection = self.client.get_or_create_collection(
             name="agent_long_term_memory",
-            embedding_function=CustomEmbeddingFunction()
+            embedding_function=self.emb_fn
         )
+
+        # --- 2. 工具索引集合 (新增功能) ---
+        self.tool_collection = self.client.get_or_create_collection(
+            name="agent_tools_index",
+            embedding_function=self.emb_fn
+        )
+
         self.user_id = "master_user"
 
     def save_facts(self, text: str):
@@ -72,7 +80,7 @@ class MemoryManager:
             metadatas = [{"user_id": self.user_id} for _ in chunks]
 
             # 把数组直接传给 ChromaDB！底层 Embedding 函数会把整个数组一次性发给 API
-            self.collection.add(
+            self.chat_collection.add(
                 documents=chunks,
                 metadatas=metadatas,
                 ids=mem_ids
@@ -84,7 +92,7 @@ class MemoryManager:
     def retrieve(self, query: str, limit: int = 3, threshold: float = 1.3) -> str:
         """检索：带有严格阈值过滤的高级捞取"""
         try:
-            results = self.collection.query(
+            results = self.chat_collection.query(
                 query_texts=[query],
                 n_results=limit,
                 where={"user_id": self.user_id} # 物理隔离：只捞当前用户的数据
@@ -109,5 +117,50 @@ class MemoryManager:
             logger.error(f"长期记忆检索失败: {e}")
             return ""
     
+
+    def index_all_tools(self, toolkit_registry: dict):
+        """
+        [系统级任务] 将所有注册的工具描述存入向量库
+        通常在 main.py 启动时调用一次
+        """
+        ids, documents, metadatas = [], [], []
+        
+        for tk_name, tk_data in toolkit_registry.items():
+            for tool_id, tool_info in tk_data["tools"].items():
+                ids.append(tool_id) # 这里是 native::office::write_local_file
+                # 我们通过工具的 Docstring 进行检索
+                documents.append(tool_info["description"])
+                # 存入元数据，方便后面反查它属于哪个工具箱
+                metadatas.append({"toolkit": tk_name})
+        
+        if ids:
+            # 使用 upsert，如果 ID 已存在则更新描述
+            self.tool_collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+            logger.info(f"🛠️ [工具索引] 已同步 {len(ids)} 个工具至 RAG 引擎。")
+
+    def search_toolkits(self, query: str, active_domains: list, limit: int = 3) -> list:
+        """
+        [决策级任务] 在 Router 选定的领域内，寻找最匹配的 Toolkit 名字
+        """
+        try:
+            results = self.tool_collection.query(
+                query_texts=[query],
+                n_results=limit,
+                # 关键：这里使用了元数据过滤，只在 Router 划定的范围内搜
+                where={"toolkit": {"$in": active_domains}} 
+            )
+            
+            # 提取元数据中的 toolkit 名字并去重
+            matched_toolkits = []
+            if results.get("metadatas"):
+                for meta in results["metadatas"][0]:
+                    if meta["toolkit"] not in matched_toolkits:
+                        matched_toolkits.append(meta["toolkit"])
+            
+            return matched_toolkits
+        except Exception as e:
+            logger.error(f"工具检索失败: {e}")
+            return active_domains # 失败则保底返回 Router 选的所有领域
+
 # 实例化全局单例
 long_term_memory = MemoryManager()

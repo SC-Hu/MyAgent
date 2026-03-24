@@ -7,7 +7,7 @@ from config import client, Config, logger
 from prompts import SYSTEM_PROMPT, REFLECTION_PROMPT
 from database import db
 from utils import count_tokens, generate_title, generate_fact_sheet
-from tools import SKILL_REGISTRY
+from tools import TOOLKIT_REGISTRY
 from router import route_intent  # 引入路由网关
 from memory_manager import long_term_memory
 
@@ -195,26 +195,36 @@ class ReActAgent:
         request_messages.append({"role": "user", "content": user_query})
         self.messages.append({"role": "user", "content": user_query})
         
-        # 调用 Router 网关
-        yield "\n\033[36m[🧭 系统路由] 分析意图，装载技能...\033[0m"
+        # --- 核心修改：三级工具加载流 ---
+        # 1. Router 选赛道 (Toolkit Names)
+        yield "\n\033[36m[🧭 系统路由] 正在匹配能力领域...\033[0m"
         
         # 直接调用从 router.py 引入的函数
-        active_skills = await route_intent(user_query)
+        active_domains = await route_intent(user_query)
 
         # 看 Router 放行了什么技能
-        print(f"\n[Router] 判决激活的技能包: {active_skills}")
+        print(f"\n[Router] 判决激活的技能包: {active_domains}")
         
-        # 拼接基础技能
-        skills_to_load = ["base"] + active_skills
-
+        # 2. Tool RAG 选重点并激活箱子
         current_tool_map = {}
         current_tools_schema = []
-        for skill in set(skills_to_load):
-            if skill in SKILL_REGISTRY:
-                # --- 现在的 SKILL_REGISTRY[skill]["tools"] 是一个字典: 
-                # {name: {"func": f, "requires_approval": b}} ---
-                current_tool_map.update(SKILL_REGISTRY[skill]["tools"])
-                current_tools_schema.extend(SKILL_REGISTRY[skill]["schemas"])
+
+        # 基础包永远加载
+        current_tool_map.update(TOOLKIT_REGISTRY["base"]["tools"])
+        current_tools_schema.extend(TOOLKIT_REGISTRY["base"]["schemas"])
+
+        if active_domains:
+            yield "\n\033[36m[🔍 工具检索] 正在从领域内筛选最匹配的工具箱...\033[0m"
+            # 这里的 RAG 检索会返回相关的 Toolkit 名字（整箱加载策略）
+            matched_tk_names = long_term_memory.search_toolkits(user_query, active_domains)
+            
+            yield f"\n\033[36m[📦 挂载完成] 已激活工具箱: {matched_tk_names}\033[0m"
+            
+            for tk_name in matched_tk_names:
+                if tk_name in TOOLKIT_REGISTRY:
+                    current_tool_map.update(TOOLKIT_REGISTRY[tk_name]["tools"])
+                    current_tools_schema.extend(TOOLKIT_REGISTRY[tk_name]["schemas"])
+
 
         for turn in range(max_turns):
             logger.info(f"\n[系统] 开始第 {turn + 1} 轮思考...")
@@ -300,7 +310,7 @@ class ReActAgent:
                 # 把单一变量改成列表，防止相互覆盖
                 submit_calls = []
                 for tc in tool_calls_list:
-                    if tc["function"]["name"] == "submit_final_answer":
+                    if tc["function"]["name"].endswith("submit_final_answer"):
                         submit_calls.append(tc)
                     else:
                         normal_tool_calls.append(tc)
